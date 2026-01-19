@@ -1,0 +1,17 @@
+# Voice AI dependencies
+pyaudio
+openai
+dashscope
+numpy
+requests
+
+# Deep Research Agent dependencies
+langgraph
+langchain-community
+langchain-openai
+jinja2
+python-dotenv
+
+# Note: You also need SearxNG running on http://127.0.0.1:38000
+# Install SearxNG separately or use Docker:
+# docker run -d -p 38000:8080 searxng/searxng

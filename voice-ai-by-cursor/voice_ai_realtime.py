@@ -11,6 +11,12 @@ from datetime import datetime
 from http import HTTPStatus
 import numpy as np
 
+# Add parent directory to Python path to find deep_research module
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+	sys.path.insert(0, parent_dir)
+
 try:
 	import pyaudio
 except ImportError:
@@ -21,6 +27,11 @@ except ImportError:
 from openai import OpenAI
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
+
+# Deep research agent imports
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SearxSearchWrapper
+from deep_research.service import DeepResearchService
 
 class VoiceAIConfig:
 	def __init__(self, mode:str="traditional"):
@@ -60,6 +71,11 @@ class VoiceAIConfig:
 		self.enable_rag = False
 		self.system_prompt = 'Please respond shortly without expressive words'
 		self.rag_context = ''
+		
+		# Deep research agent configuration
+		# Get API keys for deep research agent
+		self.ali_api_key = os.environ.get('ALI_API_KEY') or self.api_key  # Fallback to DASHSCOPE_API_KEY
+		self.searx_host = os.environ.get('SEARX_HOST', 'http://127.0.0.1:38000')
 
 class MicrophoneInput:
 	def __init__(self, config: VoiceAIConfig):
@@ -189,6 +205,23 @@ class RealTimeVoiceAI:
 
 		self.is_running = False
 		self.is_listening = False
+		
+		# Initialize deep research service
+		print(f"🔧 Initializing deep research service...")
+		print(f"  SearxNG host: {config.searx_host}")
+		# LLM for deep research agent
+		deep_research_llm = ChatOpenAI(
+			model='deepseek-r1',
+			api_key=config.ali_api_key,
+			base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+		)
+		print(f"  Deep research LLM: deepseek-r1")
+		# Search engine for deep research agent
+		search_engine = SearxSearchWrapper(searx_host=config.searx_host, k=3)
+		print(f"  Search engine: SearxSearchWrapper (k=3)")
+		# Create deep research service instance
+		self.deep_research_service = DeepResearchService(deep_research_llm, search_engine)
+		print(f"✅ Deep research service initialized")
 
 	def set_rag_context(self, context: str):
 		# set knowledge base for injecting 
@@ -259,7 +292,7 @@ class RealTimeVoiceAI:
 			# add rag context
 			if self.config.enable_rag and self.config.rag_context:
 				system_context += f'\n\ncontext/knowledge base:\n{self.config.rag_context}'
-				print(f'rag context is added to system prompt with {len(context)} characters')
+				print(f'rag context is added to system prompt with {len(self.config.rag_context)} characters')
 
 			# add user message to history
 			self.conversation_history.append({
@@ -293,6 +326,50 @@ class RealTimeVoiceAI:
 		except Exception as e:
 			print(f'❌LLM error:{e}')
 			return "sorry, I cannot answer"
+
+	def fetch_deep_research_background(self, brand: str) -> str:
+		"""
+		Call deep-research-agent directly (no HTTP) to get background info and return a summary string.
+		"""
+		try:
+			query = (
+				f"Provide a concise background brief for the brand '{brand}'. "
+				"Cover origin, core products/services, market position, recent news, "
+				"customer sentiment themes, and notable risks or controversies."
+			)
+			print(f"🔬 Running deep research for brand '{brand}'...")
+			print(f"📝 Query: {query[:100]}...")
+			print(f"🔍 This will trigger search operations via SearxNG...")
+			answer = self.deep_research_service.run(query)
+			if not answer:
+				print(f"⚠️  Deep research returned empty answer")
+				return ""
+			print(f"✅ Deep research succeeded for brand '{brand}'")
+			print(f"📊 Answer length: {len(answer)} characters")
+			print(f"📄 Answer preview: {answer[:200]}...")
+			return answer
+		except Exception as e:
+			print(f"❌ Deep research failed: {e}")
+			import traceback
+			traceback.print_exc()
+			return ""
+
+	def prime_rag_with_brand(self, brand: str):
+		"""
+		Run deep research for the brand and seed the RAG context for subsequent turns.
+		"""
+		if not brand:
+			return
+		research = self.fetch_deep_research_background(brand)
+		if not research:
+			print("Deep research returned empty; continuing without RAG context.")
+			return
+		self.set_rag_context(research)
+		# Make the system prompt explicitly brand-aware
+		self.set_system_prompt(
+			f"You are a concise voice assistant helping with questions about '{brand}'. "
+			f"Use the provided background when relevant, and keep answers short."
+		)
 
 	def synthesize_speech(self, text:str) -> bytes:
 		"""
@@ -518,6 +595,10 @@ class RealTimeVoiceAI:
 		self.initialize()
 		self.is_running = True
 		try:
+			brand = input('Enter a brand to research for context (or press Enter to skip): ').strip()
+			if brand:
+				print(f'Running deep research for brand "{brand}"...')
+				self.prime_rag_with_brand(brand)
 			while self.is_running: 
 				user_input = input('press enter to speak or quit for exit')
 
@@ -535,10 +616,34 @@ class RealTimeVoiceAI:
 		self.speaker.stop()
 
 def main():
+	import logging
+	# Enable logging for deep research agent
+	logging.basicConfig(
+		level=logging.INFO,
+		format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+	)
+	
 	if not os.environ.get("DASHSCOPE_API_KEY"):
+		print("❌ Error: DASHSCOPE_API_KEY environment variable is not set")
 		sys.exit(1)
+	
+	# Check SearxNG availability
+	searx_host = os.environ.get('SEARX_HOST', 'http://127.0.0.1:38000')
+	print(f"🔍 Checking SearxNG at {searx_host}...")
+	try:
+		import requests
+		response = requests.get(searx_host, timeout=2)
+		if response.status_code == 200:
+			print(f"✅ SearxNG is accessible")
+		else:
+			print(f"⚠️  SearxNG returned status {response.status_code}")
+	except Exception as e:
+		print(f"⚠️  Warning: Could not connect to SearxNG at {searx_host}")
+		print(f"   Error: {e}")
+		print(f"   Make sure SearxNG is running: docker run -d -p 38000:8080 searxng/searxng")
+	
 	while True: 
-		mode_choice = input('choose mode 1Traditional or 2omni with number only').strip()
+		mode_choice = input('choose mode 1Traditional or 2omni with number only: ').strip()
 		if mode_choice == '1':
 			mode = 'traditional'
 			break
@@ -547,7 +652,7 @@ def main():
 			break
 		else:
 			print(f'invalid, please choose 1 or 2')
-	# print()
+	
 	try:
 		config = VoiceAIConfig(mode=mode)
 		voice_ai = RealTimeVoiceAI(config)
