@@ -10,11 +10,19 @@ class DeepResearchService:
         logger.info("🔬 Initializing DeepResearchService...")
         logger.info(f"  LLM: {llm.model_name if hasattr(llm, 'model_name') else type(llm)}")
         logger.info(f"  Search engine: {type(search_engine)}")
+        # 保存原始 llm 和搜索引擎，给简洁版 RAG 使用
+        self.llm = llm
+        self.search_engine = search_engine
+
+        # 创建完整版 RAG 的 agent
         self.agent = create_agent(llm, search_engine)
         logger.info("✅ DeepResearchService initialized")
         
-    def run(self, query: str) -> str:
+    def run(self, query: str, mode: str = "rag") -> str:
         logger.info(f"🚀 Starting deep research for query: {query[:100]}...")
+        if mode == "rag":
+            return self.simple_rag(query)
+
         initial_agent_state = {
             'date': datetime.now().strftime('%Y-%m-%d'),
             'search_num': 3,
@@ -38,3 +46,88 @@ class DeepResearchService:
         except Exception as e:
             logger.error(f"❌ Deep research agent failed: {e}", exc_info=True)
             raise
+
+    # ===== 简洁版 RAG：LLM -> keywords -> 搜索引擎 -> LLM 总结 =====
+
+    def _generate_search_keywords(self, question: str, max_keywords: int = 3) -> list[str]:
+        """
+        使用 LLM 从问题里抽取少量检索关键词。
+        返回关键词列表，例如 ["Apple iPhone 销量 2024", "Apple Vision Pro 市场反馈"]
+        """
+        prompt = (
+            "你是搜索关键词生成助手。\n"
+            "请根据下面的用户问题，生成不超过 "
+            f"{max_keywords} 组适用于通用搜索引擎的查询关键词，"
+            "尽量覆盖问题中的关键信息（品牌、产品、时间、市场、风险等）。\n"
+            "只输出关键词，用竖线 '|' 分隔，不要输出其它说明文字。\n\n"
+            f"用户问题：{question}\n\n"
+            "输出示例：\n"
+            "Apple iPhone 15 销量 2024|Apple Vision Pro 用户反馈\n"
+        )
+
+        # ChatOpenAI 支持直接用字符串 prompt
+        resp = self.llm.invoke(prompt)
+        if hasattr(resp, "content"):
+            text = resp.content.strip()
+        else:
+            text = str(resp).strip()
+
+        # 按 | 拆分关键词，去掉空白
+        keywords = [kw.strip() for kw in text.split("|") if kw.strip()]
+        return keywords[:max_keywords] if keywords else [question]
+
+    def _search_with_keywords(self, keywords: list[str]) -> str:
+        """
+        用 SearxSearchWrapper 对每个关键词搜索，并把结果拼在一起返回。
+        这里使用 search_engine.run()，它会返回一个汇总字符串。
+        """
+        logger.info(f"🔍 Simple RAG 搜索关键词: {keywords}")
+        snippets: list[str] = []
+        for kw in keywords:
+            try:
+                result = self.search_engine.run(kw)  # SearxSearchWrapper 的简洁接口
+                snippets.append(f"【搜索：{kw}】\n{result}")
+            except Exception as e:
+                logger.warning(f"搜索 '{kw}' 失败: {e}")
+        return "\n\n".join(snippets)
+
+    def simple_rag(self, question: str, max_keywords: int = 3) -> str:
+        """
+        简洁版 RAG 流程：
+        1. 用 LLM 生成搜索关键词
+        2. 用 Searx 搜索，拿到聚合文本
+        3. 用 LLM 对这些搜索结果进行总结，直接回答问题
+        """
+        logger.info(f"🚀 Simple RAG for question: {question[:100]}")
+
+        # 1. 生成搜索关键词
+        keywords = self._generate_search_keywords(question, max_keywords=max_keywords)
+        logger.info(f"🔑 生成的搜索关键词: {keywords}")
+
+        # 2. 搜索引擎检索
+        search_text = self._search_with_keywords(keywords)
+        if not search_text:
+            logger.warning("⚠️ Simple RAG 搜索结果为空，直接用 LLM 内部知识回答")
+            search_text = "(未从网络检索到有效信息)"
+
+        # 3. 用 LLM 总结
+        summary_prompt = (
+            "你是一个简洁、可靠的研究助手。\n"
+            "我会给你一个用户问题，以及基于搜索引擎得到的一些原始资料片段。\n"
+            "请基于这些资料，按如下要求回答问题：\n"
+            "1. 回答要围绕用户问题，只总结资料中能支持的结论，不要臆测。\n"
+            "2. 如果资料中信息有限，请明确说明不确定或缺失的部分。\n"
+            "3. 尽量结构化输出，使用简短段落或列表。\n\n"
+            f"【用户问题】\n{question}\n\n"
+            f"【搜索资料】\n{search_text}\n\n"
+            "现在请给出综合性的中文回答："
+        )
+
+        resp = self.llm.invoke(summary_prompt)
+        if hasattr(resp, "content"):
+            answer = resp.content.strip()
+        else:
+            answer = str(resp).strip()
+
+        logger.info(f"📝 Simple RAG answer length: {len(answer)} characters")
+        return answer

@@ -4,6 +4,7 @@ openai
 dashscope
 numpy
 requests
+python-multipart
 
 # Deep Research Agent dependencies
 langgraph

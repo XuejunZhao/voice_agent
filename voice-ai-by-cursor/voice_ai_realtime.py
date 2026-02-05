@@ -1,5 +1,13 @@
 import os
 import sys
+
+# ✅ 先把项目根目录加进 sys.path，再 import deep_research 等内部包
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# 标准库 import
 import asyncio
 import wave
 import json
@@ -11,35 +19,30 @@ from datetime import datetime
 from http import HTTPStatus
 import numpy as np
 
-# Add parent directory to Python path to find deep_research module
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-	sys.path.insert(0, parent_dir)
-
 try:
-	import pyaudio
+    import pyaudio
 except ImportError:
-	print(f'❌pyaudio not installed. Installing...')
-	os.system('pip install pyaudio')
-	import pyaudio
+    print(f'❌pyaudio not installed. Installing...')
+    os.system('pip install pyaudio')
+    import pyaudio
 
 from openai import OpenAI
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
 
-# Deep research agent imports
+# Deep research agent imports（现在 sys.path 已经设置好，可以安全 import）
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SearxSearchWrapper
 from deep_research.service import DeepResearchService
 
 class VoiceAIConfig:
-	def __init__(self, mode:str="traditional"):
+	def __init__(self, mode:str="traditional", search_type:str="rag"):
 		self.api_key=os.environ.get('DASHSCOPE_API_KEY')
 		if not self.api_key:
 			raise ValueError("DASHSCOPE_API_KEY environment variable is not set")
 
 		self.mode = mode
+		self.search_type = search_type
 
 		self.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -69,14 +72,26 @@ class VoiceAIConfig:
 
 		# RAG configuration
 		self.enable_rag = False
-		self.system_prompt = 'Please respond shortly without expressive words'
+		self.system_prompt = (
+			"你是一个专业的砍价/议价语音助手，目标是在不失礼的前提下，为用户争取更低价格或更好权益。\n"
+			"你会收到两类信息：\n"
+			"1) 商家刚刚说的话（语音转文字）\n"
+			"2) 背景知识（RAG 检索到的：参考价格、常见优惠、竞品价格、活动规律、风险点等）\n\n"
+			"你的输出必须满足：\n"
+			"- 只输出用户下一句要对商家说的话（口语化、简短、有礼貌）。\n"
+			"- 明确目标：降价 / 赠品 / 包邮 / 延保 / 以旧换新 / 发票 / 分期优惠 等，择一两项重点推进。\n"
+			"- 不要编造事实：如果背景知识没有明确数据，不要报具体数字，用“我看到类似价格/有过活动”等模糊表达。\n"
+			"- 优先用可执行的谈判策略：锚定、对比、让步换取、限时决策、组合诉求（降价+赠品）、请求上级审批。\n"
+			"- 如果商家拒绝，给出下一步备选方案（例如转赠品、包邮、返现、延保）。\n"
+		)
+		# ✅ 删除这行，它覆盖了上面的砍价 prompt
+		# self.system_prompt = 'Please respond shortly without expressive words'
 		self.rag_context = ''
 		
 		# Deep research agent configuration
 		# Get API keys for deep research agent
 		self.ali_api_key = os.environ.get('ALI_API_KEY') or self.api_key  # Fallback to DASHSCOPE_API_KEY
 		self.searx_host = os.environ.get('SEARX_HOST', 'http://127.0.0.1:38000')
-
 class MicrophoneInput:
 	def __init__(self, config: VoiceAIConfig):
 		self.config = config
@@ -332,15 +347,21 @@ class RealTimeVoiceAI:
 		Call deep-research-agent directly (no HTTP) to get background info and return a summary string.
 		"""
 		try:
-			query = (
-				f"Provide a concise background brief for the brand '{brand}'. "
-				"Cover origin, core products/services, market position, recent news, "
-				"customer sentiment themes, and notable risks or controversies."
-			)
+			# query = (
+			# 	f"我正在和商家砍价，以下是当前关键信息/商家话术：'{brand}'。\n"
+			# 	"请快速检索并总结用于砍价的背景信息，要求简洁、可直接用于谈判：\n"
+			# 	"1) 该商品/服务的常见成交价区间（最近/近期）与影响因素（版本、渠道、地区、套餐等）\n"
+			# 	"2) 竞品或同类替代的价格对比（同档位/同配置）\n"
+			# 	"3) 常见优惠方式：满减、券、赠品、延保、包邮、安装、返现、分期免息等\n"
+			# 	"4) 如果商家报价偏高：可以使用的合理理由/话术点（不要编造）\n"
+			# 	"5) 风险/注意事项（低价陷阱、翻新、渠道保修差异等）\n"
+			# 	"输出为要点列表，避免长篇大论。"
+			# )
+			query=brand.strip()
 			print(f"🔬 Running deep research for brand '{brand}'...")
 			print(f"📝 Query: {query[:100]}...")
 			print(f"🔍 This will trigger search operations via SearxNG...")
-			answer = self.deep_research_service.run(query)
+			answer = self.deep_research_service.run(query, mode=self.config.search_type)
 			if not answer:
 				print(f"⚠️  Deep research returned empty answer")
 				return ""
@@ -367,8 +388,9 @@ class RealTimeVoiceAI:
 		self.set_rag_context(research)
 		# Make the system prompt explicitly brand-aware
 		self.set_system_prompt(
-			f"You are a concise voice assistant helping with questions about '{brand}'. "
-			f"Use the provided background when relevant, and keep answers short."
+			f"你是砍价/议价语音助手。当前目标商品/商家信息：{brand}。\n"
+			"你会基于后续提供的背景知识，帮用户用礼貌但坚定的方式争取更低价格或更好权益。\n"
+			"只输出用户下一句要说的话，简短口语化。"
 		)
 
 	def synthesize_speech(self, text:str) -> bytes:
@@ -380,11 +402,17 @@ class RealTimeVoiceAI:
 			audio bytes
 		"""
 		try: 
+			# result = dashscope.audio.tts.SpeechSynthesizer.call(
+			# 	model=self.config.tts_model,
+			# 	text=text,
+			# 	sample_rate=self.config.sample_rate,
+			# 	format='pcm')
 			result = dashscope.audio.tts.SpeechSynthesizer.call(
 				model=self.config.tts_model,
 				text=text,
 				sample_rate=self.config.sample_rate,
-				format='pcm')
+				format='wav'  # ✅ 改成 wav
+			)
 
 			if result:
 				try:
@@ -543,7 +571,28 @@ class RealTimeVoiceAI:
 			if not user_text or len(user_text.strip()) < 2: 
 				print('User text too short, skipping')
 				return 
+			# 1) 先阻塞生成 rag（拿到字符串结果）
+			dialog_rag = self.fetch_deep_research_background(user_text)
+			# 后台打印当前轮的 RAG 背景，便于调试/观察
+			print("==== DIALOG RAG START ====")
+			print(dialog_rag or "（空）")
+			print("==== DIALOG RAG END ====")
 
+			# 2) rag 生成完毕后再写入 context（并开启 enable_rag）
+			if dialog_rag:
+				self.set_rag_context(dialog_rag)
+
+			# 3) 最后再调用 LLM（此时会带上 rag_context）
+				# negotiation_turn_prompt = (
+				# 	"【场景】你正在替用户和商家砍价。\n"
+				# 	"【商家刚刚说】\n"
+				# 	f"{user_text}\n\n"
+				# 	"【你的任务】\n"
+				# 	"- 给出用户下一句要对商家说的话（中文口语，1-2 句）。\n"
+				# 	"- 优先争取“更低价格”，如果不行就争取“赠品/包邮/延保/返现/分期优惠”等。\n"
+				# 	"- 结合你收到的背景知识（系统里的 context/knowledge base），不要编造。\n"
+				# )
+				# assistant_text = self.get_llm_response(negotiation_turn_prompt)
 			assistant_text = self.get_llm_response(user_text)
 			print(f'Assistant Text: "{assistant_text}"')
 
